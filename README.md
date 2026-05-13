@@ -132,17 +132,33 @@ The extension is built natively on Manifest V3 using **TypeScript and Vite 5** f
 
 Contributions, issues, and feature requests are welcome! We have labeled issues for all skill levels.
 
+> ⚠️ **Before making ANY changes**, you **must fork** this repository and **create a new branch** from `main`. Direct commits to the main repository are not accepted. All contributions must come through Pull Requests from your fork.
+
 **Quick start:**
-1. Fork the repo and clone locally
-2. `npm install` → `npm run build`
-3. Load the `dist/` folder in Chrome
-4. Pick an issue labeled [`good first issue`](https://github.com/shouri123/Late-Meet/labels/good%20first%20issue) or [`help wanted`](https://github.com/shouri123/Late-Meet/labels/help%20wanted)
+1. **Fork** the repo on GitHub (click the Fork button)
+2. **Clone** your fork: `git clone https://github.com/<your-username>/Late-Meet.git`
+3. **Create a new branch**: `git checkout -b feature/your-feature-name`
+4. `npm install` → `npm run build`
+5. Load the `dist/` folder in Chrome
+6. Make your changes, test, and submit a PR
+
+**Found a bug or have an idea?** Open a public issue on the [Issues page](https://github.com/shouri123/Late-Meet/issues)! We use issue templates for [bug reports](.github/ISSUE_TEMPLATE/bug_report.md) and [feature requests](.github/ISSUE_TEMPLATE/feature_request.md) to keep things organized.
 
 When contributing:
 1. Emphasize vanilla, zero-dependency JavaScript workflows where possible.
 2. Adhere strictly to the monochromatic UI design system.
 
 > 📖 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for full setup instructions, project structure walkthrough, and PR guidelines.
+
+---
+
+## 🐛 Known Issues
+
+| Issue | Status | Link |
+|-------|--------|------|
+| Audio capture intermittently fails after migration from OpenAI Whisper to ElevenLabs Scribe STT | 🔴 Open | [#1](https://github.com/shouri123/Late-Meet/issues/1) |
+
+> If you encounter any other issues, please [open a new issue](https://github.com/shouri123/Late-Meet/issues/new/choose) with as much detail as possible. Screenshots and console logs are very helpful!
 
 ---
 
