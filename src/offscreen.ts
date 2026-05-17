@@ -16,11 +16,11 @@ let isDrainingQueue = false;
 
 const CHUNK_MS = 10000;
 const VAD_SAMPLE_MS = 250;
-const RMS_THRESHOLD = 0.012;
+let rmsThreshold = 0.012;
 
 let isFlushInProgress = false;
 let voiceActivity = new VoiceActivityTracker({
-  rmsThreshold: RMS_THRESHOLD,
+  rmsThreshold: rmsThreshold,
 });
 
 function blobToBase64(blob: Blob): Promise<string> {
@@ -191,7 +191,7 @@ async function cleanupResources() {
   isStopping = false;
 
   voiceActivity = new VoiceActivityTracker({
-    rmsThreshold: RMS_THRESHOLD,
+    rmsThreshold: rmsThreshold,
   });
 }
 async function getTabAudioStream(streamId: string) {
@@ -246,6 +246,9 @@ async function startCapture(streamId: string, _tabId: number, includeMicrophone 
       microphoneActive: Boolean(microphoneStream),
     };
   }
+  const config = await chrome.storage.local.get("settings");
+
+  rmsThreshold = config?.settings?.vadThreshold || 0.012;
 
   mediaStream = await getTabAudioStream(streamId);
 
@@ -320,7 +323,7 @@ async function startCapture(streamId: string, _tabId: number, includeMicrophone 
   mediaRecorder.start(CHUNK_MS);
 
   voiceActivity = new VoiceActivityTracker({
-    rmsThreshold: RMS_THRESHOLD,
+    rmsThreshold: rmsThreshold,
   });
 
   vadTimer = setInterval(() => {
