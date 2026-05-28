@@ -819,45 +819,33 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   document.getElementById("export-clipboard-btn")?.addEventListener("click", async () => {
     try {
-      const state = await chrome.runtime.sendMessage({
-        type: "GET_STATE",
-      });
-
+      const state = await chrome.runtime.sendMessage({ type: "GET_STATE" });
       if (!state) {
         showToast("No meeting data available", "error");
         return;
       }
-
       const markdown = generateMarkdown(state);
-
-      // Modern clipboard API
       if (navigator.clipboard && window.isSecureContext) {
         await navigator.clipboard.writeText(markdown);
       } else {
-        // Fallback method
         const textArea = document.createElement("textarea");
-
         textArea.value = markdown;
-
         textArea.style.position = "fixed";
         textArea.style.left = "-999999px";
         textArea.style.top = "-999999px";
-
         document.body.appendChild(textArea);
-
         textArea.focus();
         textArea.select();
-
         document.execCommand("copy");
-
         textArea.remove();
       }
-
       showToast("Copied to clipboard", "success");
     } catch (err) {
       console.error(err);
-
       showToast("Failed to copy to clipboard", "error");
+    } finally {
+      exportDropdown?.setAttribute("hidden", "");
+      exportBtn?.setAttribute("aria-expanded", "false");
     }
   });
 
