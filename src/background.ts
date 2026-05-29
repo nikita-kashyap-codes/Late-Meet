@@ -2,6 +2,17 @@
 
 import { State } from "./types";
 import { audioFileExtensionForMimeType, isChunkViable } from "./audioProcessing";
+import {
+  deleteSavedMeetingSession,
+  discardPendingMeetingSession,
+  getSavedMeetingSessions,
+  isStorageQuotaError,
+  persistMeetingSession,
+  persistPendingMeetingSession,
+  savePendingMeetingSession,
+  StoredSession,
+} from "./sessionStorage";
+import { AudioChunkQueue, AudioChunkQueueItem } from "./audioChunkQueue";
 
 const OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions";
 const OPENAI_WHISPER_URL = "https://api.openai.com/v1/audio/transcriptions";
@@ -12,6 +23,7 @@ const TRANSCRIPT_WINDOW_SIZE = 25;
 const SUMMARIZATION_MAX_TOKENS = 1200;
 const JOINER_MESSAGE_MAX_TOKENS = 120;
 const ELEVENLABS_STT_MODEL = "scribe_v2";
+const MAX_PENDING_AUDIO_CHUNKS = 8;
 // Delay late-joiner auto messages until 10s to avoid lobby/join churn spam.
 const MIN_MEETING_DURATION_FOR_WELCOME = 10;
 
@@ -241,6 +253,7 @@ function resetState() {
   state.targetTabId = null;
   state.lastSummarizedAt = 0;
   state.pendingJoiners.clear();
+  audioChunkQueue.clear();
   state.participantCount = 0;
   selfParticipantName = null;
 }
@@ -274,6 +287,7 @@ function snapshot() {
     keyInsights: state.keyInsights,
     questionsRaised: state.questionsRaised,
     participants: state.participants,
+    initialParticipants: state.initialParticipants,
     lateJoiners: state.lateJoiners,
     timeline: state.timeline,
     transcript: state.transcript,
@@ -703,6 +717,55 @@ Return a JSON object with these exact keys:
   }
 }
 
+interface QueuedAudioChunk {
+  audioBase64: string;
+  mimeType: string;
+  approxBytes: number;
+  receivedAt: number;
+}
+
+async function processQueuedAudioChunk({ id, item }: AudioChunkQueueItem<QueuedAudioChunk>) {
+  if (!state.isActive) {
+    console.warn(`[LateMeet] queued audio chunk ${id} ignored because session is inactive`);
+    return;
+  }
+
+  console.log(
+    `[LateMeet] processing queued chunk ${id} — ~${item.approxBytes} bytes  mimeType=${item.mimeType}`,
+  );
+
+  const prompt = getTranscriptionPrompt();
+  const rawText = await transcribeChunk(item.audioBase64, item.mimeType, prompt);
+
+  if (!rawText) {
+    console.warn(`[LateMeet] STT returned empty for queued chunk ${id}`);
+    return;
+  }
+
+  console.log(`[LateMeet] transcript received for chunk ${id} — ${rawText.length} chars`);
+  const refinedText = await refineTranscription(rawText);
+  console.log(`[LateMeet] transcript refined for chunk ${id} — ${refinedText.length} chars`);
+
+  state.transcript.push({
+    speaker: "Audio",
+    text: refinedText,
+    timestamp: item.receivedAt,
+  });
+
+  await summarizeTranscriptIfNeeded();
+  await broadcastStateUpdate();
+}
+
+const audioChunkQueue = new AudioChunkQueue<QueuedAudioChunk>({
+  maxPending: MAX_PENDING_AUDIO_CHUNKS,
+  process: processQueuedAudioChunk,
+  onError: async (err, { id }) => {
+    console.error(`[LateMeet] queued chunk ${id} processing failed:`, err);
+    addTimeline(`Audio chunk ${id} processing failed`);
+    await broadcastStateUpdate();
+  },
+});
+
 function detectNewJoiners(currentList: string[]) {
   if (state.participants.length === 0 && state.initialParticipants.length === 0) {
     state.initialParticipants = [...currentList];
@@ -835,30 +898,73 @@ async function maybeWelcomeJoiners(tabId: number | undefined, joiners: string[])
 }
 
 async function savePendingSession() {
-  const session = {
+  const session: StoredSession = {
     id: crypto.randomUUID(),
     ...snapshot(),
     savedAt: Date.now(),
     isActive: false,
   };
-  await chrome.storage.local.set({ pendingSession: session });
+
+  inMemoryPendingSession = session;
+
+  try {
+    await savePendingMeetingSession(chrome.storage.local, session);
+  } catch (err) {
+    console.error("[LateMeet] Failed to save pending session:", err);
+    if (isStorageQuotaError(err)) {
+      console.error(
+        "[LateMeet] Storage quota reached while saving pending session. Keep this extension active and export the session before closing Chrome.",
+      );
+    }
+  }
 }
 
-async function persistSession() {
-  const { pendingSession, savedSessions } = await chrome.storage.local.get([
-    "pendingSession",
-    "savedSessions",
-  ]);
-  if (!pendingSession) return;
+let isProcessingSession = false;
+let inMemoryPendingSession: StoredSession | null = null;
 
-  const sessions = Array.isArray(savedSessions) ? savedSessions : [];
-  sessions.unshift(pendingSession);
-  await chrome.storage.local.set({ savedSessions: sessions, pendingSession: null });
+async function persistSession() {
+  if (isProcessingSession) {
+    console.log("[LateMeet] Already processing session, ignoring duplicate save request.");
+    return;
+  }
+  isProcessingSession = true;
+  try {
+    let session: StoredSession;
+    try {
+      session = await persistPendingMeetingSession(chrome.storage.local);
+    } catch (err) {
+      if (!inMemoryPendingSession) throw err;
+      session = await persistMeetingSession(chrome.storage.local, inMemoryPendingSession);
+    }
+    inMemoryPendingSession = null;
+    console.log("[LateMeet] Session successfully saved:", session.id);
+  } catch (err) {
+    console.error("[LateMeet] Error persisting session:", err);
+    throw err;
+  } finally {
+    isProcessingSession = false;
+  }
 }
 
 async function discardPendingSession() {
-  await chrome.storage.local.set({ pendingSession: null });
+  if (isProcessingSession) {
+    console.log("[LateMeet] Already processing session, ignoring duplicate discard request.");
+    return;
+  }
+  isProcessingSession = true;
+  try {
+    inMemoryPendingSession = null;
+    await discardPendingMeetingSession(chrome.storage.local);
+    console.log("[LateMeet] Pending session discarded.");
+  } catch (err) {
+    console.error("[LateMeet] Error discarding session:", err);
+    throw err;
+  } finally {
+    isProcessingSession = false;
+  }
 }
+
+let isStartingAudio = false;
 
 async function startAudioCapture(
   tabId: number,
@@ -868,22 +974,31 @@ async function startAudioCapture(
   includeMicrophone = true,
 ) {
   if (!tabId) throw new Error("Missing target tab id");
-
-  await ensureOffscreenDocument();
+  if (state.audioActive) {
+    console.log("[LateMeet] Audio already active, skipping start request.");
+    return;
+  }
+  if (isStartingAudio) {
+    console.log("[LateMeet] Audio start already in progress, skipping start request.");
+    return;
+  }
+  isStartingAudio = true;
 
   const createdSession = !state.isActive;
 
-  if (createdSession) {
-    resetState();
-    state.isActive = true;
-    state.startTime = Date.now();
-    state.meetingId = meetingId || "unknown";
-    state.meetingUrl = meetingUrl || null;
-    state.targetTabId = tabId;
-    addTimeline(`Meeting started (${state.meetingId})`);
-  }
-
   try {
+    await ensureOffscreenDocument();
+
+    if (createdSession) {
+      resetState();
+      state.isActive = true;
+      state.startTime = Date.now();
+      state.meetingId = meetingId || "unknown";
+      state.meetingUrl = meetingUrl || null;
+      state.targetTabId = tabId;
+      addTimeline(`Meeting started (${state.meetingId})`);
+    }
+
     let streamId = providedStreamId;
 
     if (!streamId) {
@@ -937,6 +1052,8 @@ async function startAudioCapture(
       await broadcastStateUpdate();
     }
     throw err;
+  } finally {
+    isStartingAudio = false;
   }
 }
 
@@ -975,7 +1092,7 @@ async function stopAudioCapture(reason = "Stopped") {
     // Ignore if offscreen not running
   }
 
-  if (state.isActive) {
+  if (state.audioActive) {
     addTimeline(`Meeting ended (${reason})`);
     await savePendingSession();
   }
@@ -1088,6 +1205,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return;
       }
 
+      case "MANUAL_STOP_AUDIO": {
+        await stopAudioCapture("Manual stop");
+        sendResponse({ success: true });
+        return;
+      }
+
       case "OFFSCREEN_LOG": {
         console.log("[LateMeet][offscreen]", message.message);
         sendResponse({ success: true });
@@ -1108,30 +1231,41 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           return;
         }
 
+        if (typeof message.audioBase64 !== "string" || !message.audioBase64) {
+          sendResponse({ success: false, error: "Missing audio chunk payload" });
+          return;
+        }
+
         const base64Len = message.audioBase64?.length ?? 0;
         const approxBytes = Math.round((base64Len * 3) / 4);
         console.log(
           `[LateMeet] chunk received — ~${approxBytes} bytes  mimeType=${message.mimeType}`,
         );
 
-        try {
-          const prompt = getTranscriptionPrompt();
-          const rawText = await transcribeChunk(message.audioBase64, message.mimeType, prompt);
-          if (rawText) {
-            console.log(`[LateMeet] transcript received — ${rawText.length} chars`);
-            const refinedText = await refineTranscription(rawText);
-            console.log(`[LateMeet] transcript refined — ${refinedText.length} chars`);
-            state.transcript.push({ speaker: "Audio", text: refinedText, timestamp: Date.now() });
-            await summarizeTranscriptIfNeeded();
-            await broadcastStateUpdate();
-          } else {
-            console.warn("[LateMeet] STT returned empty — chunk may be silent or too short");
-          }
-          sendResponse({ success: true });
-        } catch (err) {
-          console.error("[LateMeet] chunk processing failed:", err);
-          sendResponse({ success: false, error: (err as Error).message });
+        const result = audioChunkQueue.enqueue({
+          audioBase64: message.audioBase64,
+          mimeType: typeof message.mimeType === "string" ? message.mimeType : "audio/webm",
+          approxBytes,
+          receivedAt: Date.now(),
+        });
+
+        if (!result.accepted) {
+          console.warn("[LateMeet] audio chunk queue full — chunk rejected");
+          sendResponse({
+            success: false,
+            queued: false,
+            pending: result.pending,
+            error: result.error,
+          });
+          return;
         }
+
+        sendResponse({
+          success: true,
+          queued: true,
+          chunkId: result.id,
+          pending: result.pending,
+        });
         return;
       }
 
@@ -1167,16 +1301,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
 
       case "GET_SAVED_SESSIONS": {
-        const { savedSessions } = await chrome.storage.local.get("savedSessions");
-        sendResponse(Array.isArray(savedSessions) ? savedSessions : []);
+        const sessions = await getSavedMeetingSessions(chrome.storage.local);
+        sendResponse(sessions);
         return;
       }
 
       case "DELETE_SAVED_SESSION": {
-        const { savedSessions } = await chrome.storage.local.get("savedSessions");
-        const sessions = Array.isArray(savedSessions) ? savedSessions : [];
-        const next = sessions.filter((s) => s.id !== message.sessionId);
-        await chrome.storage.local.set({ savedSessions: next });
+        await deleteSavedMeetingSession(chrome.storage.local, message.sessionId);
         sendResponse({ success: true });
         return;
       }
@@ -1191,6 +1322,35 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   });
 
   return true;
+});
+
+// Keyboard Shortcut Commands
+chrome.commands.onCommand.addListener(async (command) => {
+  try {
+    if (command === "toggle-recording") {
+      if (state.audioActive) {
+        await stopAudioCapture("Keyboard shortcut stop");
+        return;
+      }
+
+      await scanForMeetTabs();
+      if (state.targetTabId) {
+        await startAudioCapture(state.targetTabId, state.meetingId, state.meetingUrl);
+      } else {
+        console.warn("[LateMeet] No active Meet tab found for keyboard shortcut.");
+      }
+      return;
+    }
+
+    if (command === "open-side-panel") {
+      const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (activeTab?.id) {
+        await chrome.sidePanel.open({ tabId: activeTab.id });
+      }
+    }
+  } catch (err) {
+    console.error("[LateMeet] Keyboard command failed:", command, err);
+  }
 });
 
 // Proactive scan on startup/load
